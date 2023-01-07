@@ -1,173 +1,125 @@
-use std::collections::HashMap;
-use std::io::Read;
-use std::process;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use anyhow::{Result, bail, Context};
+use hyper::body::HttpBody;
 
-use hyper::header::Header;
-use regex::Regex;
-use reqwest::header::{Cookie, Location, SetCookie};
-use reqwest::{Client, RedirectPolicy};
+use reqwest::header::{HeaderValue, LOCATION, SET_COOKIE};
+use reqwest::Client;
+use reqwest::cookie::{CookieStore, Jar};
+use reqwest::redirect::Policy;
+use soup::{NodeExt, QueryBuilderExt, Soup};
 
 
 /// Log in to Pinboard and get a login cookie that can be used on subsequent
 /// requests.
 ///
-fn get_login_cookie(username: &str, password: &str) -> Cookie {
+async fn get_login_cookie(username: &str, password: &str) -> Result<Jar> {
     // Start by logging in to Pinboard, so we have the appropriate cookies.
     // Because Pinboard sends us into a weird redirect loop, we have to
     // tell reqwest not to follow redirects, just check the redirect worked.
     let client = Client::builder()
-        .unwrap()
-        .redirect(RedirectPolicy::none())
-        .build()
-        .unwrap();
+        .redirect(Policy::none())
+        .build()?;
 
-    let resp = client.post("https://pinboard.in/auth/")
-        .unwrap()
+    let response = client
+        .post("https://pinboard.in/auth/")
         .form(&[("username", &username), ("password", &password)])
-        .unwrap()
-        .send();
-    let headers = resp.ok().unwrap().headers().to_owned();
-    let login_successful = headers
-        .get::<Location>()
-        .unwrap() != &Location::new("?error=wrong+password");
-    if !login_successful {
-        eprintln!("Error logging in to Pinboard!");
-        process::exit(1);
+        .send()
+        .await?;
+
+    if !matches!(
+        response.headers().get(LOCATION),
+        Some(location) if location != HeaderValue::from_static("?error=wrong+password")
+    ) {
+        bail!("Error logging in to Pinboard!")
     }
 
-    // Cookie-handling code.  This should probably be handled by reqwest,
-    // but I've given up trying to get it working, and I'm just doing it
-    // by hand instead.  Pinboard only sets four interesting cookie values.
-    let set_cookie = headers
-        .get::<SetCookie>()
-        .unwrap();
-    let mut cookie = Cookie::new();
-    for c in set_cookie.iter() {
-        let parsed = Cookie::parse_header(&c.as_bytes().into()).unwrap();
-        for key in vec!["groznaz", "auth", "secauth", "login"].iter() {
-            match parsed.get(key) {
-                Some(val) => cookie.set(key.to_owned(), val.to_owned()),
-                None => {},
-            };
-        }
-    }
+    let mut set_cookie_header = response
+        .headers()
+        .get_all(SET_COOKIE);
 
-    cookie
+    let cookie_jar = Jar::default();
+    cookie_jar.set_cookies(&mut set_cookie_header.iter(), response.url());
+
+    Ok(cookie_jar)
 }
 
 
 /// Given a blob of HTML from a Pinboard index, update the map of cache IDs
 /// and corresponding links.
-fn get_cache_ids_from_html(html: &str, cache_ids: &mut HashMap<String, String>) {
-    // Parsing HTML with regex or string manipulation is, in general,
-    // a terrible idea.  I'm doing it here because I couldn't work out how
-    // to use html5ever from their API docs, and I'm tired.
-    // TODO: Write this to be not terrible.
-
-    // All the bookmarks on a page are in a
-    //
-    //      <div id="bookmarks"> … </div>
-    //
-    // block, so start by extracting that.
-    let bookmarks_div = html
-        .split("<div id=\"bookmarks\">").collect::<Vec<&str>>()[1]
-        .split("<div id=\"right_bar\">").collect::<Vec<&str>>()[0];
-
-    // Individual bookmarks always have
-    //
-    //      <div name="edit_checkbox" class="edit_checkbox>">
-    //
-    // at the top, so we can use this as a rough proxy for bookmarks.
-    let mut bookmarks = bookmarks_div
-        .split("<div name=\"edit_checkbox\" class=\"edit_checkbox\">");
-
-    // Discard the first entry.
-    bookmarks.next();
-
-    // The links to cached bookmarks are of the form
-    //
-    //      <a class="cached" href="/cached/123456789abcdef/">☑</a>
-    //
-    let cached_re = Regex::new(
-        "<a class=\"cached\" href=\"/cached/(?P<cache_id>[0-9a-f]+)/\">"
-    ).unwrap();
-
-    // The links to bookmarks are of the form
-    //
-    //      <a class="bookmark_title" href="..."
-    //
-    let link_re = Regex::new(
-        "<a class=\"bookmark_title[a-z_ ]+\"\\s*href=\"(?P<link_href>[^\"]+)\""
-    ).unwrap();
-
-    for b in bookmarks {
-        if cached_re.is_match(b) {
-            let cache_match = cached_re.captures(b)
-                .unwrap()["cache_id"]
-                .to_owned();
-
-            let link_match = link_re.captures(b)
-                .unwrap()["link_href"]
-                .to_owned();
-
-            cache_ids.insert(link_match, cache_match);
-        } else {
-            // This doesn't have a link, so we can't save it.
-            continue;
-        }
-    }
+fn get_cache_ids_from_html(html_soup: &Soup) -> HashSet<String>{
+    html_soup
+        .tag("a")
+        .class("cached")
+        .recursive(true)
+        .find_all()
+        .filter_map(|element| element.get("href"))
+        .collect()
 }
 
 
-fn get_html_for_page(client: &Client, path: &str, cookie: &Cookie) -> String {
+async fn get_html_for_page(client: &Client, path: &str) -> Result<String> {
     let url = format!("https://pinboard.in{}", path);
-    let resp = client.get(&url)
-        .unwrap()
-        .header(cookie.to_owned())
-        .send();
-    let mut content = String::new();
-    let _ = resp.ok().unwrap().read_to_string(&mut content);
-    content
+
+    let response = client
+        .get(&url)
+        .send()
+        .await?;
+
+    response
+        .text()
+        .await
+        .context("Failed to get html for page")
 }
 
 
-fn get_next_page_path(html: &str) -> Option<String> {
-    let next_href_re = Regex::new(
-        "<a class=\"next_prev\" href=\"(?P<next_href>[^\"]+)\">« earlier"
-    ).unwrap();
-
-    match next_href_re.captures(html) {
-        Some(s) => Some(s["next_href"].to_owned()),
-        None => None,
-    }
+fn get_next_page_path(html_soup: &Soup) -> Option<String> {
+    html_soup
+        .tag("a")
+        .attr("id", "top_earlier")
+        .recursive(true)
+        .find()
+        .and_then(|element| element.get("href"))
 }
 
+async fn update_cache_ids_for_path(
+    client: &Client,
+    path: &str
+) -> Result<(HashSet<String>, Option<String>)> {
+    let content = get_html_for_page(&client, &path).await?;
 
-fn update_cache_ids_for_path(client: &Client, path: &str, cookie: &Cookie, mut cache_ids: &mut HashMap<String, String>) {
-    println!("Inspecting path {}", path);
-    let content = get_html_for_page(&client, &path, &cookie);
-    get_cache_ids_from_html(&content, &mut cache_ids);
-    match get_next_page_path(&content) {
-        Some(next_path) => update_cache_ids_for_path(&client, &next_path, &cookie, &mut cache_ids),
-        None => {}
-    };
+    let soup = Soup::new(&content);
+    let cache_ids = get_cache_ids_from_html(&soup);
+    let next_page = get_next_page_path(&soup);
+
+    Ok((cache_ids, next_page))
 }
-
 
 /// Return a map from URLs to Pinboard cache IDs.
 ///
 ///  - `username`: Pinboard username
 ///  - `password`: Pinboard password
 ///
-pub fn get_cache_ids(username: &str, password: &str) -> HashMap<String, String> {
+pub async fn get_cache_ids(username: &str, password: &str) -> Result<HashSet<String>> {
+    let cookie_jar = get_login_cookie(&username, &password).await?;
+    let client = Client::builder()
+        .cookie_provider(Arc::new(cookie_jar))
+        .build()?;
 
-    let client = Client::new().unwrap();
-    let cookie = get_login_cookie(&username, &password);
-    let mut cache_ids = HashMap::new();
+    let mut cache_ids = HashSet::new();
 
     // Now fetch a blob of HTML for the first page.
-    let path = format!("/u:{}/", username);
-    update_cache_ids_for_path(&client, &path, &cookie, &mut cache_ids);
+    let mut next_path = Some(format!("/u:{}/?per_page=160", username));
 
-    cache_ids
+    while let Some(path) = &next_path {
+        let (
+            new_cache_ids,
+            new_path
+        ) = update_cache_ids_for_path(&client, path).await?;
+
+        cache_ids.extend(new_cache_ids);
+        next_path = new_path;
+    }
+
+    Ok(cache_ids)
 }
