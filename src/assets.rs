@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use anyhow::{Result, bail, Context};
-use hyper::body::HttpBody;
 
 use reqwest::header::{HeaderValue, LOCATION, SET_COOKIE};
 use reqwest::Client;
@@ -34,7 +33,7 @@ async fn get_login_cookie(username: &str, password: &str) -> Result<Jar> {
         bail!("Error logging in to Pinboard!")
     }
 
-    let mut set_cookie_header = response
+    let set_cookie_header = response
         .headers()
         .get_all(SET_COOKIE);
 
