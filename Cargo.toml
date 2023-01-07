@@ -1,10 +1,11 @@
 [package]
 name = "backup-pinboard"
-version = "0.0.3"
+version = "0.0.4"
 authors = ["d0nut <d0nut@resync.gg>"]
 edition = "2021"
 description = "Cli to download your Pinboard archives."
 license = "MIT"
+keywords = ["pinboard", "backup", "cli"]
 homepage = "https://github.com/d0nutptr/backup-pinboard"
 
 [dependencies]
