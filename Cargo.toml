@@ -1,6 +1,6 @@
 [package]
 name = "backup-pinboard"
-version = "0.0.1"
+version = "0.0.2"
 authors = ["d0nut <d0nut@resync.gg>"]
 edition = "2021"
 description = "Cli to download your Pinboard archives."
