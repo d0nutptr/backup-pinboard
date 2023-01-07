@@ -4,6 +4,7 @@ mod cli;
 
 use std::path::Path;
 use std::process::Output;
+use std::time::Duration;
 use crate::cli::{ArchiveFlags, Cli, MetadataFlags, SubCommand};
 use clap::Parser;
 use anyhow::{bail, Context, Result};
@@ -59,7 +60,7 @@ async fn do_archive(ArchiveFlags { username, password, output_directory, concurr
 }
 
 async fn get_bookmark_contents(output_directory: &str, url: &str) -> Result<Output> {
-    Command::new("wget")
+    let output_future = Command::new("wget")
         .arg("--adjust-extension")
         .arg("--span-hosts")
         .arg("--no-verbose")
@@ -71,8 +72,11 @@ async fn get_bookmark_contents(output_directory: &str, url: &str) -> Result<Outp
         .args(&["--output-file", "-"])
         .args(&["--directory-prefix", output_directory])
         .arg(&url)
-        .output()
+        .output();
+
+    tokio::time::timeout(Duration::from_secs(60), output_future)
         .await
+        .context("Archive timed out")?
         .context("Failed to download archive from Pinboard")
 }
 
